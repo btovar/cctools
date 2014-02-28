@@ -1242,7 +1242,7 @@ static int process_result(struct work_queue *q, struct work_queue_worker *w, con
 	w->memory_allocated -= t->memory;
 	w->disk_allocated -= t->disk;
 	w->gpus_allocated -= t->gpus;
-	
+
 	if(t->unlabeled) {
 		t->cores = t->memory = t->disk = t->gpus = -1;
 	}
@@ -2342,11 +2342,11 @@ static int start_tasks(struct work_queue *q, time_t stoptime)
 				start_task_on_worker(q, w);
 				task_started++;
 			} else {
-				//Move task to the end of queue when there is at least one available worker.  
+				//Move task to the end of queue when there is at least one available worker.
 				//This prevents a resource-hungry task from clogging the entire queue.
 				if(available_workers(q) > 0) {
 					list_push_tail(q->ready_list, list_pop_head(q->ready_list));
-				}	
+				}
 				break;
 			}
 			//stoptime <= 0 means an infinite timeout
@@ -3513,7 +3513,7 @@ static int wait_loop_poll_links(struct work_queue *q, int stoptime, struct link 
 		while(hash_table_nextkey(q->workers_with_available_results,&key,(void**)&w)) {
 			process_available_results(q, w, -1);
 			hash_table_remove(q->workers_with_available_results, key);
-		}	
+		}
 	}
 
 	return result;
@@ -3524,7 +3524,7 @@ static void wait_loop_transfer_tasks(struct work_queue *q, time_t stoptime)
 	int task_started;
 	int tasks_received;
 
-	do 
+	do
 	{
 		//Compute task_transfer_stoptime in some way...
 		time_t task_transfer_stoptime = MIN(stoptime, INT64_MAX);
