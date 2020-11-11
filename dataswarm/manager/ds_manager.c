@@ -182,7 +182,6 @@ static void process_tasks(struct ds_manager *m) {
 			case DS_TASK_DELETED:
 				// nothing to do, wait for the client
 				continue;
-			case DS_TASK_RUNNING:
 			case DS_TASK_DELETING:
 				// nothing to do, wait for the worker
 				continue;
@@ -195,6 +194,9 @@ static void process_tasks(struct ds_manager *m) {
 			case DS_TASK_RESULT_UNDEFINED:
 				// nothing to do
 				continue;
+		}
+
+		/* FIX: THESE SHOULD GO SOMEWHERE WHERE WE PROCESS ATTEMPTS. THIS LOOP IS ONLY FOR TASKS, NO TASK ATTEMPTS
 			case DS_TASK_RESULT_FIX:
 				fix_task(t);
 				continue;
@@ -202,6 +204,7 @@ static void process_tasks(struct ds_manager *m) {
 				retry_task(t);
 				continue;
 		}
+		*/
 
 		if (!t->worker) {
 			schedule_task(m, t);
