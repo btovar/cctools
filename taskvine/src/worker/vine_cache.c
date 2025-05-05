@@ -320,12 +320,25 @@ int vine_cache_add_transfer(struct vine_cache *c, const char *cachename, const c
 	/* Has this transfer already been queued? */
 	struct vine_cache_file *f = hash_table_lookup(c->table, cachename);
 	if (f) {
-		/* The transfer is already queued up. */
-		return 1;
+        debug(D_VINE, "xfering %s again", cachename);
+        switch (f->status) {
+        case VINE_CACHE_STATUS_PROCESSING:
+        case VINE_CACHE_STATUS_TRANSFERRED:
+        case VINE_CACHE_STATUS_READY:
+        case VINE_CACHE_STATUS_PENDING:
+            /* The transfer is already queued up. */
+            debug(D_VINE, "xfering %s again oh no", cachename);
+            return 1;
+            break;
+        case VINE_CACHE_STATUS_FAILED:
+        case VINE_CACHE_STATUS_UNKNOWN:
+            debug(D_VINE, "xfering %s again right", cachename);
+            vine_cache_remove(c, cachename, NULL);
+            break;
+        }
 	}
 
 	/* Create the object and fill in the metadata. */
-
 	f = vine_cache_file_create(VINE_CACHE_TRANSFER, source, 0);
 
 	/*
@@ -341,37 +354,10 @@ int vine_cache_add_transfer(struct vine_cache *c, const char *cachename, const c
 	f->mtime = 0;
 	f->transfer_time = 0;
 
-	int status = hash_table_insert(c->table, cachename, f);
-	if (!status) {
-		int bad_cache = 0;
-		struct vine_cache_file *previous = hash_table_remove(c->table, cachename);
-		if (!previous) {
-			bad_cache = 1;
-		} else {
-			switch (previous->status) {
-			case VINE_CACHE_STATUS_PROCESSING:
-			case VINE_CACHE_STATUS_TRANSFERRED:
-			case VINE_CACHE_STATUS_READY:
-			case VINE_CACHE_STATUS_PENDING:
-				bad_cache = 1;
-				break;
-			case VINE_CACHE_STATUS_FAILED:
-			case VINE_CACHE_STATUS_UNKNOWN:
-				break;
-			}
-			vine_cache_file_delete(previous);
-			hash_table_insert(c->table, cachename, f);
-		}
-
-		if (bad_cache) {
-			fatal("Manager sent conflicting cache information.");
-		}
-	}
-
+	hash_table_insert(c->table, cachename, f);
 	hash_table_insert(c->pending_transfers, cachename, NULL);
 
 	/* Note metadata is not saved here but when transfer is completed. */
-
 	if (flags & VINE_CACHE_FLAGS_NOW) {
 		vine_cache_ensure(c, cachename);
 	}
@@ -422,7 +408,9 @@ int vine_cache_remove(struct vine_cache *c, const char *cachename, struct link *
 		return 0;
 
 	/* Ensure that any child process associated with the entry is stopped. */
-	vine_cache_kill(c, f, cachename, manager);
+    if (manager) {
+        vine_cache_kill(c, f, cachename, manager);
+    }
 
 	hash_table_remove(c->pending_transfers, cachename);
 	hash_table_remove(c->processing_transfers, cachename);
@@ -711,8 +699,14 @@ vine_cache_status_t vine_cache_ensure(struct vine_cache *c, const char *cachenam
 			LIST_ITERATE(f->mini_task->input_mounts, m)
 			{
 				result = vine_cache_ensure(c, m->file->cached_name);
-				if (result != VINE_CACHE_STATUS_READY)
+				if (result == VINE_CACHE_STATUS_FAILED) {
+                    /* an input file for the mini task failed to transfer,
+                     * thus the mini task is marked also as failed */
+                    f->status = VINE_CACHE_STATUS_FAILED;
+                    return f->status;
+                } else if (result != VINE_CACHE_STATUS_READY) {
 					return result;
+                }
 			}
 		}
 	}
