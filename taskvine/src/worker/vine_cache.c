@@ -691,6 +691,7 @@ vine_cache_status_t vine_cache_ensure(struct vine_cache *c, const char *cachenam
 		break;
 	}
 
+    int mini_task_inputs_permanent_failure = 0;
 	/* For a mini-task, we must also insure the inputs to the task exist. */
 	if (f->cache_type == VINE_CACHE_MINI_TASK) {
 		if (f->mini_task->input_mounts) {
@@ -702,8 +703,8 @@ vine_cache_status_t vine_cache_ensure(struct vine_cache *c, const char *cachenam
 				if (result == VINE_CACHE_STATUS_FAILED) {
                     /* an input file for the mini task failed to transfer,
                      * thus the mini task is marked also as failed */
-                    f->status = VINE_CACHE_STATUS_FAILED;
-                    return f->status;
+                    mini_task_inputs_permanent_failure = 1;
+                    break;
                 } else if (result != VINE_CACHE_STATUS_READY) {
 					return result;
                 }
@@ -719,10 +720,7 @@ vine_cache_status_t vine_cache_ensure(struct vine_cache *c, const char *cachenam
 		struct vine_process *p = vine_process_create(f->mini_task, VINE_PROCESS_TYPE_MINI_TASK);
 		if (!vine_sandbox_stagein(p, c)) {
 			debug(D_VINE, "cache: can't stage input files for task %d.", p->task->task_id);
-			p->task = 0;
-			vine_process_delete(p);
-			f->status = VINE_CACHE_STATUS_FAILED;
-			return f->status;
+            mini_task_inputs_permanent_failure = 1;
 		}
 		f->process = p;
 	}
@@ -754,7 +752,9 @@ vine_cache_status_t vine_cache_ensure(struct vine_cache *c, const char *cachenam
 		}
 		return f->status;
 	} else {
-		vine_cache_worker_process(f, c, cachename);
+        if (!mini_task_inputs_permanent_failure) {
+            vine_cache_worker_process(f, c, cachename);
+        }
 		_exit(1);
 	}
 }
