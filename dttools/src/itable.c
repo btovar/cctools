@@ -147,6 +147,11 @@ int itable_insert(struct itable *h, UINT64_T key, const void *value)
 	struct entry *e;
 	UINT64_T index;
 
+	/* Here we would like to print a warning if the key already exists in the table with a different value
+	   as we do with hash tables, but work queue keeps the state of tasks in an itable that is modified during
+	   the tasks lifetime.
+	*/
+
 	if (((float)h->size / h->bucket_count) > DEFAULT_LOAD)
 		itable_double_buckets(h);
 
