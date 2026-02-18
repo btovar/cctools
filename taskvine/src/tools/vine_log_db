@@ -83,7 +83,7 @@ def display_paged(lines, header_lines=None):
     rows, _ = get_terminal_size()
     # Reserve lines for status and prompt
     header_count = len(header_lines)
-    page_size = max(1, rows - 3 - header_count)
+    page_size = max(1, rows - 6 - header_count)
     total_pages = (len(lines) + page_size - 1) // page_size
 
     if total_pages <= 1:
@@ -1611,18 +1611,32 @@ def _show_lines_in_time_range(conn, low_us, high_us):
     )
 
 
-def cmd_time(conn, time_arg, range_arg=None):
-    """Show raw lines at the given absolute time (microseconds or YYYY/MM/DD-HH:MM:SS.nn)."""
-    low_us, high_us = parse_time_spec_to_us(time_arg, range_arg, absolute_only=True)
-    if low_us is None or high_us is None:
-        print("Usage: time <time_spec> [range_seconds]")
+def cmd_time(conn, time_arg, offset1=None, offset2=None):
+    """Show raw lines in the time range [time_us + min(offset1, offset2), time_us + max(offset1, offset2)]."""
+    base_low, base_high = parse_time_spec_to_us(time_arg, None, absolute_only=True)
+    if base_low is None or base_high is None:
+        print("Usage: time <time_us> [offset1] [offset2]")
         print(
-            "  time_spec: absolute time — microseconds (e.g. 1234567890123456) or YYYY/MM/DD-HH:MM:SS.nn"
+            "  time_us: absolute time — microseconds (e.g. 1234567890123456) or YYYY/MM/DD-HH:MM:SS.nn"
         )
         print(
-            "  range_seconds: optional; if given, show lines in [time_spec, time_spec + range_seconds]"
+            "  offset1, offset2: optional integers (microseconds), default 0; range is time_us + min(offset1, offset2) .. time_us + max(offset1, offset2)"
         )
         return
+    base_us = base_low
+    try:
+        o1 = int(offset1) if offset1 is not None else 0
+    except (TypeError, ValueError):
+        o1 = 0
+    try:
+        o2 = int(offset2) if offset2 is not None else 0
+    except (TypeError, ValueError):
+        o2 = 0
+    low_us = base_us + min(o1, o2)
+    high_us = base_us + max(o1, o2)
+    # When both offsets are 0, use a 1-second window so we show lines "at" that time instead of requiring an exact microsecond match
+    if low_us == high_us:
+        high_us = low_us + 1_000_000
     _show_lines_in_time_range(conn, low_us, high_us)
 
 
@@ -1639,6 +1653,127 @@ def cmd_timer(conn, time_arg, range_arg=None):
         )
         return
     _show_lines_in_time_range(conn, low_us, high_us)
+
+
+def cmd_maxdiff(conn, column_arg, n_arg):
+    """Show the maximum N deltas for a performance column, with time deltas and times at which they occurred."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='performance'"
+    )
+    if not cursor.fetchone():
+        print("Error: No performance table in database.")
+        return
+    cursor.execute("PRAGMA table_info(performance)")
+    all_cols = [row[1] for row in cursor.fetchall()]
+    # Data columns (exclude id, line_number, time_us, time_relative)
+    skip = {"id", "line_number", "time_relative"}
+    data_cols = [c for c in all_cols if c not in skip]
+    if not data_cols:
+        print("Error: No data columns in performance table.")
+        return
+    # Match column (case-insensitive)
+    col_lower = column_arg.strip().lower()
+    chosen = None
+    for c in data_cols:
+        if c.lower() == col_lower:
+            chosen = c
+            break
+    if chosen is None:
+        print(f"Error: Column '{column_arg}' not found in performance table.")
+        print(f"Available columns: {', '.join(data_cols)}")
+        return
+    try:
+        n = int(n_arg) if n_arg is not None else 5
+    except (TypeError, ValueError):
+        n = 5
+    if n < 1:
+        print("Error: N must be a positive integer.")
+        return
+    query = f"SELECT time_us, time_relative, {chosen} FROM performance ORDER BY time_us"
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    if len(rows) < 2:
+        print("Need at least two performance rows to compute deltas.")
+        return
+    deltas = []
+    for i in range(1, len(rows)):
+        prev = rows[i - 1]
+        curr = rows[i]
+        time_us, time_rel, val = prev[0], prev[1], prev[2]
+        time_us_next, _, val_next = curr[0], curr[1], curr[2]
+        if val is None or val_next is None:
+            continue
+        delta_value = val_next - val
+        delta_time_us = time_us_next - time_us if (time_us_next is not None and time_us is not None) else None
+        deltas.append((val, val_next, delta_value, delta_time_us, time_us, time_rel))
+    if not deltas:
+        print("No deltas (all values or times missing).")
+        return
+    # Top N by absolute delta value
+    deltas.sort(key=lambda x: abs(x[2]), reverse=True)
+    top = deltas[:n]
+    header_lines = [
+        f"Top {len(top)} delta(s) for column '{chosen}' (by absolute change):",
+        "",
+        f"{'val':<20} {'val_next':<20} {'delta_value':<20} {'delta_time_sec':<16} {'time_us':<20} {'time_rel':<20}",
+        "-" * (20 + 20 + 20 + 16 + 20 + 20),
+    ]
+    lines = []
+    for val, val_next, delta_value, delta_time_us, time_us, time_rel in top:
+        delta_sec = (delta_time_us / 1_000_000.0) if delta_time_us is not None else None
+        delta_sec_str = f"{delta_sec:.6f}" if delta_sec is not None else "N/A"
+        time_us_str = str(time_us) if time_us is not None else "N/A"
+        time_rel_str = str(time_rel) if time_rel is not None else "N/A"
+        lines.append(
+            f"{val:<20} {val_next:<20} {delta_value:<20} {delta_sec_str:<16} {time_us_str:<20} {time_rel_str:<20}"
+        )
+    display_paged(lines, header_lines=header_lines)
+
+
+def cmd_diff(conn, time_us_arg, column_args):
+    """At the row with the given time_us, print the difference of the given performance columns vs next row."""
+    cursor = conn.cursor()
+    try:
+        time_us_val = int(time_us_arg)
+    except (TypeError, ValueError):
+        print(f"Error: Invalid time_us value '{time_us_arg}' (expected integer microseconds).")
+        return
+    if not column_args:
+        # Default columns when none given
+        column_args = ["tasks_waiting", "tasks_on_workers", "tasks_running", "tasks_with_results", "tasks_submitted", "tasks_dispatched", "tasks_done", "tasks_failed", "tasks_cancelled", "tasks_exhausted_attempts"]
+    cols_sql = ", ".join(column_args)
+    query = f"SELECT time_us, time_relative, {cols_sql} FROM performance WHERE time_us >= {time_us_val} ORDER BY time_us LIMIT 2"
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    if not rows:
+        print("No performance rows in database.")
+        return
+    curr_row = rows[0]
+    next_row = rows[1]
+    time_us_curr, time_rel_curr = curr_row[0], curr_row[1]
+    time_us_next, time_rel_next = next_row[0], next_row[1]
+    # Column indices: 0=time_us, 1=time_relative, 2..=chosen columns
+    col_start = 2
+    rows = []
+    for j, col in enumerate(column_args):
+        vi = col_start + j
+        curr_val = curr_row[vi]
+        next_val = next_row[vi] if next_row is not None else None
+        diff_next = (next_val - curr_val) if (curr_val is not None and next_val is not None) else None
+        curr_str = f"{curr_val}" if curr_val is not None else "N/A"
+        next_str = f"{next_val}" if next_val is not None else "N/A"
+        diff_next_str = f"{diff_next}" if diff_next is not None else "N/A"
+        rows.append((col, curr_str, next_str, diff_next_str))
+    w_col, w_curr, w_next, w_delta = 28, 14, 14, 14
+    header_lines = [
+        f"Diff at time_us={time_us_curr} ({time_rel_curr or 'N/A'}) vs time_us={time_us_next} ({(time_us_next - time_us_curr) / 1_000_000:.6f} seconds)",
+        "",
+        f"{'column':<{w_col}} {'current':<{w_curr}} {'next':<{w_next}} {'delta':<{w_delta}}",
+        "-" * (w_col + w_curr + w_next + w_delta + 3),
+    ]
+    lines = [f"{col:<{w_col}} {curr_str:<{w_curr}} {next_str:<{w_next}} {diff_next_str:<{w_delta}}" for col, curr_str, next_str, diff_next_str in rows]
+    display_paged(lines, header_lines=header_lines)
 
 
 def cmd_refresh(conn, directory):
@@ -2276,6 +2411,15 @@ def main():
             "  train <N>                 - times when tasks_with_results > N% of tasks_on_workers"
         )
         print(
+            "  maxdiff <column> [N]      - top N deltas for a performance column (default N=5); shows delta value, delta time, and times"
+        )
+        print(
+            "  diff <time_us> [col ...]       - at row with time_us, print difference of performance columns vs previous and next row"
+        )
+        print(
+            "                                 (if no columns given: tasks_waiting, tasks_on_workers, tasks_running, tasks_waiting_retrieval)"
+        )
+        print(
             "  task <N>                  - raw lines from transactions and debug log for task id N (sorted by time)"
         )
         print(
@@ -2335,6 +2479,28 @@ def main():
                 cmd_train(conn, arg)
                 continue
 
+            if line.lower().startswith("maxdiff "):
+                rest = line[8:].strip().split()
+                if not rest:
+                    print("Usage: maxdiff <column> [N]   (N defaults to 5)")
+                    continue
+                col_arg = rest[0]
+                n_arg = None
+                if len(rest) >= 2 and rest[1].isdigit() and int(rest[1]) > 0:
+                    n_arg = rest[1]
+                cmd_maxdiff(conn, col_arg, n_arg)
+                continue
+
+            if line.lower().startswith("diff "):
+                rest = line[5:].strip().split()
+                if len(rest) < 1:
+                    print("Usage: diff <time_us> [column ...]")
+                    continue
+                time_us_arg = rest[0]
+                column_args = rest[1:]  # if empty, cmd_diff uses default columns
+                cmd_diff(conn, time_us_arg, column_args)
+                continue
+
             if line.lower().startswith("task "):
                 arg = line[5:].strip()
                 cmd_task(conn, arg)
@@ -2348,10 +2514,11 @@ def main():
                 continue
 
             if line.lower().startswith("time "):
-                parts = line[5:].strip().split(None, 1)
+                parts = line[5:].strip().split()
                 time_arg = parts[0] if parts else ""
-                range_arg = parts[1] if len(parts) > 1 else None
-                cmd_time(conn, time_arg, range_arg)
+                offset1 = parts[1] if len(parts) > 1 else None
+                offset2 = parts[2] if len(parts) > 2 else None
+                cmd_time(conn, time_arg, offset1, offset2)
                 continue
 
             if line.lower() == "refresh":
