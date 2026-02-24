@@ -1581,7 +1581,7 @@ def cmd_task(conn, task_id_str):
 
 
 def _show_lines_in_time_range(conn, low_us, high_us):
-    """Query debug and transactions for low_us..high_us and display with [D:line_no]/[T:line_no]."""
+    """Query debug, transactions, and performance for low_us..high_us and display with [D:line_no]/[T:line_no]/[P:line_no]."""
     cursor = conn.cursor()
     rows = []
     cursor.execute(
@@ -1597,6 +1597,15 @@ def _show_lines_in_time_range(conn, low_us, high_us):
     for r in cursor.fetchall():
         rows.append((r[0], "T", r[1], r[2] or ""))
 
+    # Add performance log rows in time range if performance table exists
+    cursor.execute(
+        f"SELECT time_us, line_number FROM performance WHERE time_us IS NOT NULL AND time_us >= ? AND time_us <= ?",
+        (low_us, high_us),
+    )
+    for r in cursor.fetchall():
+        time_us, line_no = r[0], r[1]
+        rows.append((time_us, "P", time_us, line_no))
+
     rows.sort(key=lambda x: (x[0], x[1]))
     if not rows:
         print(f"No log lines in time range {low_us}–{high_us}.")
@@ -1605,7 +1614,7 @@ def _show_lines_in_time_range(conn, low_us, high_us):
     display_paged(
         lines,
         header_lines=[
-            f"Log lines in time range ({len(lines)} line(s)), sorted by time:",
+            f"Log lines (debug [D], transactions [T], performance [P]) in time range ({len(lines)} line(s)), sorted by time:",
             "",
         ],
     )
@@ -1655,7 +1664,7 @@ def cmd_timer(conn, time_arg, range_arg=None):
     _show_lines_in_time_range(conn, low_us, high_us)
 
 
-def cmd_maxdiff(conn, column_arg, n_arg):
+def cmd_maxdiffp(conn, column_arg, n_arg):
     """Show the maximum N deltas for a performance column, with time deltas and times at which they occurred."""
     cursor = conn.cursor()
     cursor.execute(
@@ -1727,6 +1736,51 @@ def cmd_maxdiff(conn, column_arg, n_arg):
         time_rel_str = str(time_rel) if time_rel is not None else "N/A"
         lines.append(
             f"{val:<20} {val_next:<20} {delta_value:<20} {delta_sec_str:<16} {time_us_str:<20} {time_rel_str:<20}"
+        )
+    display_paged(lines, header_lines=header_lines)
+
+
+def cmd_maxdiffd(conn, n_arg):
+    """Show the maximum N time deltas (gaps between consecutive performance rows). Always uses time_us order."""
+    cursor = conn.cursor()
+    try:
+        n = int(n_arg) if n_arg is not None else 5
+    except (TypeError, ValueError):
+        n = 5
+    if n < 1:
+        print("Error: N must be a positive integer.")
+        return
+    cursor.execute(
+        "SELECT time_us, time_relative FROM debug ORDER BY time_us"
+    )
+    rows = cursor.fetchall()
+    if len(rows) < 2:
+        print("Need at least two performance rows to compute time deltas.")
+        return
+    deltas = []
+    for i in range(1, len(rows)):
+        time_us_prev, time_rel_prev = rows[i - 1][0], rows[i - 1][1]
+        time_us_curr, time_rel_curr = rows[i][0], rows[i][1]
+        if time_us_prev is None or time_us_curr is None:
+            continue
+        delta_time_us = time_us_curr - time_us_prev
+        deltas.append((time_us_prev, time_rel_prev, time_us_curr, time_rel_curr, delta_time_us))
+    if not deltas:
+        print("No time deltas (times missing).")
+        return
+    deltas.sort(key=lambda x: x[4], reverse=True)
+    top = deltas[:n]
+    header_lines = [
+        f"Top {len(top)} time delta(s) (by delta time_us, rows ordered by time_us):",
+        "",
+        f"{'time_us_prev':<20} {'time_rel_prev':<20} {'time_us_curr':<20} {'time_rel_curr':<20} {'delta_time_sec':<16}",
+        "-" * (20 + 20 + 20 + 20 + 16),
+    ]
+    lines = []
+    for time_us_prev, time_rel_prev, time_us_curr, time_rel_curr, delta_time_us in top:
+        delta_sec = delta_time_us / 1_000_000.0
+        lines.append(
+            f"{time_us_prev!s:<20} {str(time_rel_prev):<20} {time_us_curr!s:<20} {str(time_rel_curr):<20} {delta_sec:<16.6f}"
         )
     display_paged(lines, header_lines=header_lines)
 
@@ -2411,10 +2465,13 @@ def main():
             "  train <N>                 - times when tasks_with_results > N% of tasks_on_workers"
         )
         print(
-            "  maxdiff <column> [N]      - top N deltas for a performance column (default N=5); shows delta value, delta time, and times"
+            "  maxdiffp <column> [N]     - top N deltas for a performance column (default N=5); shows delta value, delta time, and times"
         )
         print(
-            "  diff <time_us> [col ...]       - at row with time_us, print difference of performance columns vs previous and next row"
+            "  maxdiffd [N]              - top N time gaps between consecutive performance rows (default N=5); sorts on time_us"
+        )
+        print(
+            "  diff <time_us> [col ...]  - at row with time_us, print difference of performance columns vs previous and next row"
         )
         print(
             "                                 (if no columns given: tasks_waiting, tasks_on_workers, tasks_running, tasks_waiting_retrieval)"
@@ -2438,7 +2495,7 @@ def main():
             "  save <file>               - save last query result to file (reruns query if needed)"
         )
         print("  help                      - list available commands")
-        print("  exit, quit, q            - exit")
+        print("  exit, quit, q             - exit")
 
     # Interactive SQL prompt
     print("\nEnter SQL queries (type 'help' for commands, 'exit' or 'quit' to exit):")
@@ -2479,16 +2536,24 @@ def main():
                 cmd_train(conn, arg)
                 continue
 
-            if line.lower().startswith("maxdiff "):
-                rest = line[8:].strip().split()
+            if line.lower().startswith("maxdiffp "):
+                rest = line[9:].strip().split()
                 if not rest:
-                    print("Usage: maxdiff <column> [N]   (N defaults to 5)")
+                    print("Usage: maxdiffp <column> [N]   (N defaults to 5)")
                     continue
                 col_arg = rest[0]
                 n_arg = None
                 if len(rest) >= 2 and rest[1].isdigit() and int(rest[1]) > 0:
                     n_arg = rest[1]
-                cmd_maxdiff(conn, col_arg, n_arg)
+                cmd_maxdiffp(conn, col_arg, n_arg)
+                continue
+
+            if line.lower().startswith("maxdiffd"):
+                rest = line[8:].strip().split()
+                n_arg = None
+                if rest and rest[0].isdigit() and int(rest[0]) > 0:
+                    n_arg = rest[0]
+                cmd_maxdiffd(conn, n_arg)
                 continue
 
             if line.lower().startswith("diff "):
