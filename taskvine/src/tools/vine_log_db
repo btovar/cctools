@@ -373,6 +373,51 @@ _RETRIEVED_RE = re.compile(
     re.DOTALL,
 )
 
+# CATEGORY: name MAX|MIN|FIRST [FIXED|MAX|MIN_WASTE|MAX_THROUGHPUT] {json}
+_CATEGORY_RE = re.compile(
+    r"CATEGORY\s+(\S+)\s+(MAX|MIN|FIRST)(?:\s+(FIXED|MAX|MIN_WASTE|MAX_THROUGHPUT))?\s*(?:\s+(\{.*\}))?$",
+    re.DOTALL,
+)
+# TASK WAITING: task_id (READY|WAITING) category (FIRST_RESOURCES|MAX_RESOURCES) attempt_number {json}
+# Manager logs VINE_TASK_READY as "READY"; accept both for compatibility.
+_TASK_WAITING_RE = re.compile(
+    r"TASK\s+(\d+)\s+(?:READY|WAITING)\s+(\S+)\s+(FIRST_RESOURCES|MAX_RESOURCES)\s+(\d+)\s*(?:\s+(\{.*\}))?$",
+    re.DOTALL,
+)
+# TASK RUNNING: task_id RUNNING worker_id (FIRST_RESOURCES|MAX_RESOURCES) {json}
+_TASK_RUNNING_RE = re.compile(
+    r"TASK\s+(\d+)\s+RUNNING\s+(\S+)\s+(FIRST_RESOURCES|MAX_RESOURCES)\s*(\{.*\})?$",
+    re.DOTALL,
+)
+# TASK WAITING_RETRIEVAL: task_id WAITING_RETRIEVAL worker_id
+_TASK_WAITING_RETRIEVAL_RE = re.compile(
+    r"TASK\s+(\d+)\s+WAITING_RETRIEVAL\s+(\S+)\s*$",
+)
+
+# INSERT for resources table (columns in _RESOURCE_NAMES order)
+_RESOURCES_INSERT_SQL = (
+    "INSERT INTO resources ("
+    + ", ".join(_RESOURCE_NAMES)
+    + ") VALUES ("
+    + ", ".join("?" * len(_RESOURCE_NAMES))
+    + ")"
+)
+
+
+def _insert_resource_row(cursor, json_str):
+    """Parse json_str as resource/limits object, insert into resources if any value present. Return id or None."""
+    if not json_str or not json_str.strip():
+        return None
+    try:
+        obj = json.loads(json_str)
+        row = _resource_row_from_parsed(_parse_resource_values(obj))
+        if not _resource_row_has_any_value(row):
+            return None
+        cursor.execute(_RESOURCES_INSERT_SQL, row)
+        return cursor.lastrowid
+    except (json.JSONDecodeError, TypeError):
+        return None
+
 
 def parse_debug_timestamp(line):
     """Parse timestamp from debug log line (YYYY/MM/DD HH:MM:SS.CC format)."""
@@ -1004,37 +1049,20 @@ def parse_debug_log(conn, log_file, start_byte=None, start_line_num=None):
             line_number INTEGER,
             time_us INTEGER,
             time_relative TEXT,
-            program TEXT,
-            pid INTEGER,
-            child_pid INTEGER,
-            flag TEXT,
-            message TEXT,
             task_id INTEGER,
             host TEXT,
             port INTEGER,
             file TEXT,
             received_sent TEXT,
-            worker_message_type TEXT,
-            worker_message_data TEXT,
-            send_message_type TEXT,
-            send_message_data TEXT,
             raw_line TEXT
         )
     """)
-    # Add send_message columns if table already existed
-    for col in ("send_message_type", "send_message_data"):
-        try:
-            cursor.execute(f"ALTER TABLE debug ADD COLUMN {col} TEXT")
-        except sqlite3.OperationalError:
-            pass
 
     # Create indexes after bulk insert (faster than updating indexes per row)
     DEBUG_INSERT_SQL = """
         INSERT INTO debug
-        (line_number, time_us, time_relative, program, pid, child_pid, flag, message,
-         task_id, host, port, file, received_sent, worker_message_type, worker_message_data,
-         send_message_type, send_message_data, raw_line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (line_number, time_us, time_relative, task_id, host, port, file, received_sent, raw_line)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     BATCH_SIZE = 5000
 
@@ -1042,12 +1070,6 @@ def parse_debug_log(conn, log_file, start_byte=None, start_line_num=None):
     start_time = time.time()
     last_pct = None
     label = f"Parsing {log_file.name}" if not resume else f"Refreshing {log_file.name}"
-
-    # Debug log format: YYYY/MM/DD HH:MM:SS.XX program[pid] <child:pid> flag: message
-    debug_pattern = re.compile(
-        r"(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d{2})\s+"
-        r"(\S+)\[(\d+)\](?:\s+<child:(\d+)>)?\s*(\S+):\s+(.*)"
-    )
 
     batch = []
     count = 0
@@ -1070,52 +1092,23 @@ def parse_debug_log(conn, log_file, start_byte=None, start_line_num=None):
             if not line:
                 continue
 
-            match = debug_pattern.match(line)
-            if not match:
-                timestamp_us = parse_debug_timestamp(line)
-                message = line
-                if timestamp_us:
-                    dt_match = _DEBUG_TIMESTAMP_RE.match(line)
-                    if dt_match:
-                        message = line[dt_match.end() :].strip()
-
+            timestamp_us = parse_debug_timestamp(line)
+            if timestamp_us is not None:
                 time_relative = format_relative_time(timestamp_us)
-                task_id = extract_task_id_from_message(message)
-                host, port = extract_host_port_from_message(message)
-                file_name = extract_file_from_message(message)
-                received_sent = extract_received_sent(message)
-
-                worker_msg_type, worker_msg_data = parse_worker_message(message)
-                worker_msg_json = (
-                    json.dumps(worker_msg_data) if worker_msg_data else None
-                )
-                send_msg_type, send_msg_data = None, None
-                if received_sent == "sent":
-                    tx_payload = extract_tx_payload(message)
-                    if tx_payload:
-                        send_msg_type, send_msg_data = parse_manager_send_message(
-                            tx_payload
-                        )
-                send_msg_json = json.dumps(send_msg_data) if send_msg_data else None
+                task_id = extract_task_id_from_message(line)
+                host, port = extract_host_port_from_message(line)
+                file_name = extract_file_from_message(line)
+                received_sent = extract_received_sent(line)
 
                 row = (
                     line_num,
                     timestamp_us,
                     time_relative,
-                    None,
-                    None,
-                    None,
-                    None,
-                    message,
                     task_id,
                     host,
                     port,
                     file_name,
                     received_sent,
-                    worker_msg_type,
-                    worker_msg_json,
-                    send_msg_type,
-                    send_msg_json,
                     line,
                 )
                 batch.append(row)
@@ -1124,72 +1117,6 @@ def parse_debug_log(conn, log_file, start_byte=None, start_line_num=None):
                     cursor.executemany(DEBUG_INSERT_SQL, batch)
                     batch = []
                 continue
-
-            year, month, day, hour, minute, second, centisecond = match.groups()[:7]
-            program = match.group(8)
-            pid = int(match.group(9))
-            child_pid = int(match.group(10)) if match.group(10) else None
-            flag = match.group(11)
-            message = match.group(12)
-
-            try:
-                dt = datetime(
-                    int(year),
-                    int(month),
-                    int(day),
-                    int(hour),
-                    int(minute),
-                    int(second),
-                    int(centisecond) * 10000,
-                )
-                timestamp_us = int(dt.timestamp() * 1000000)
-            except Exception:
-                timestamp_us = None
-            if timestamp_us is None:
-                continue
-
-            time_relative = format_relative_time(timestamp_us)
-            task_id = extract_task_id_from_message(message)
-            host, port = extract_host_port_from_message(message)
-            file_name = extract_file_from_message(message)
-            received_sent = extract_received_sent(message)
-
-            worker_msg_type, worker_msg_data = parse_worker_message(message)
-            worker_msg_json = json.dumps(worker_msg_data) if worker_msg_data else None
-            send_msg_type, send_msg_data = None, None
-            if received_sent == "sent":
-                tx_payload = extract_tx_payload(message)
-                if tx_payload:
-                    send_msg_type, send_msg_data = parse_manager_send_message(
-                        tx_payload
-                    )
-            send_msg_json = json.dumps(send_msg_data) if send_msg_data else None
-
-            row = (
-                line_num,
-                timestamp_us,
-                time_relative,
-                program,
-                pid,
-                child_pid,
-                flag,
-                message,
-                task_id,
-                host,
-                port,
-                file_name,
-                received_sent,
-                worker_msg_type,
-                worker_msg_json,
-                send_msg_type,
-                send_msg_json,
-                line,
-            )
-            batch.append(row)
-            count += 1
-            if len(batch) >= BATCH_SIZE:
-                cursor.executemany(DEBUG_INSERT_SQL, batch)
-                batch = []
 
     if batch:
         cursor.executemany(DEBUG_INSERT_SQL, batch)
@@ -1200,9 +1127,6 @@ def parse_debug_log(conn, log_file, start_byte=None, start_line_num=None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_debug_task ON debug(task_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_debug_host ON debug(host)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_debug_file ON debug(file)")
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_debug_send_type ON debug(send_message_type)"
-    )
 
     print_parse_progress(
         bytes_read_before + bytes_read_this_run,
@@ -1874,11 +1798,23 @@ def cmd_refresh(conn, directory):
                 save_read_position(conn, "transactions", txn_log, result[0], result[1])
         else:
             cursor = conn.cursor()
+            for table in (
+                "txns_manager",
+                "txns_worker",
+                "txns_category",
+                "txns_waiting",
+                "txns_running",
+                "txns_waiting_retrieval",
+                "txns_retrieved",
+            ):
+                try:
+                    cursor.execute(f"DELETE FROM {table}")
+                except sqlite3.OperationalError:
+                    pass
             try:
-                cursor.execute("DELETE FROM transactions")
                 conn.commit()
             except sqlite3.OperationalError:
-                pass  # table may not exist yet
+                pass
             result = parse_transaction_log(conn, txn_log)
             if result:
                 save_read_position(conn, "transactions", txn_log, result[0], result[1])
@@ -1924,11 +1860,90 @@ def cmd_refresh(conn, directory):
     print("Refresh complete.")
 
 
+def _parse_txn_manager_row(line_num, time_us, time_relative, manager_pid, event_data, raw_line):
+    """Parse MANAGER / LIBRARY / APPLICATION lines. Returns (table_name, row_list, resource_json)."""
+    if event_data.startswith("MANAGER"):
+        event_type = "MANAGER"
+    elif event_data.startswith("LIBRARY"):
+        event_type = "LIBRARY"
+    elif event_data.startswith("APPLICATION"):
+        event_type = "APPLICATION"
+    else:
+        return None
+    row = [line_num, time_us, time_relative, manager_pid, event_type, event_data, raw_line]
+    return ("txns_manager", row, None)
+
+
+def _parse_txn_worker_row(line_num, time_us, time_relative, manager_pid, event_data, raw_line):
+    """Parse WORKER lines. Returns (table_name, row_list, resource_json)."""
+    if not event_data.startswith("WORKER"):
+        return None
+    row = [line_num, time_us, time_relative, manager_pid, "WORKER", event_data, raw_line]
+    return ("txns_worker", row, None)
+
+
+def _parse_txn_category_row(line_num, time_us, time_relative, event_data, raw_line):
+    """Parse CATEGORY lines. Returns (table_name, row_list, resource_json) or None."""
+    m = _CATEGORY_RE.match(event_data)
+    if not m:
+        return None
+    name, kind, sub = m.group(1), m.group(2), m.group(3)
+    event_type = kind if sub is None else f"{kind} {sub}"
+    json_str = m.group(4) if m.lastindex >= 4 and m.group(4) else None
+    row = [line_num, time_us, time_relative, name, event_type, None, raw_line]
+    return ("txns_category", row, json_str)
+
+
+def _parse_txn_task_row(line_num, time_us, time_relative, event_data, raw_line, current_attempts):
+    """Parse TASK WAITING / RUNNING / WAITING_RETRIEVAL (not RETRIEVED). Returns (table_name, row_list, resource_json) or None."""
+    if _RETRIEVED_RE.match(event_data):
+        return None
+    m = _TASK_WAITING_RETRIEVAL_RE.match(event_data)
+    if m:
+        task_id = int(m.group(1))
+        row = [line_num, time_us, time_relative, task_id, current_attempts.get(task_id, 0), raw_line]
+        return ("txns_waiting_retrieval", row, None)
+    m = _TASK_WAITING_RE.match(event_data)
+    if m:
+        task_id = int(m.group(1))
+        attempt_number = int(m.group(4))
+        current_attempts[task_id] = attempt_number
+        category = m.group(2)
+        json_str = m.group(5) if m.lastindex >= 5 and m.group(5) else None
+        row = [line_num, time_us, time_relative, task_id, category, attempt_number, None, raw_line]
+        return ("txns_waiting", row, json_str)
+    m = _TASK_RUNNING_RE.match(event_data)
+    if m:
+        task_id = int(m.group(1))
+        worker_id = m.group(2)
+        json_str = m.group(4) if m.lastindex >= 4 and m.group(4) else None
+        row = [line_num, time_us, time_relative, task_id, current_attempts.get(task_id, 0), worker_id, None, raw_line]
+        return ("txns_running", row, json_str)
+    return None
+
+
 def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
     """Parse transaction log file and insert into database.
     If start_byte and start_line_num are set, resume from that position (for refresh).
     Returns (last_byte_position, last_line_number) for saving read position.
     """
+    # time manager_pid MANAGER manager_pid START|END time_from_origin
+    # time manager_pid WORKER worker_id CONNECTION host:port
+    # time manager_pid WORKER worker_id DISCONNECTION (UNKNOWN|IDLE_OUT|FAST_ABORT|FAILURE|STATUS_WORKER|EXPLICIT|XFER_ERRORS)
+    # time manager_pid WORKER worker_id RESOURCES {resources}
+    # time manager_pid WORKER worker_id CACHE_UPDATE filename size_in_mb wall_time_us start_time_us
+    # time manager_pid WORKER worker_id TRANSFER (INPUT|OUTPUT) filename size_in_mb wall_time_us start_time_us
+    # time manager_pid CATEGORY name MAX {resources_max_per_task}
+    # time manager_pid CATEGORY name MIN {resources_min_per_task_per_worker}
+    # time manager_pid CATEGORY name FIRST (FIXED|MAX|MIN_WASTE|MAX_THROUGHPUT) {resources_requested}
+    # time manager_pid TASK task_id WAITING category_name (FIRST_RESOURCES|MAX_RESOURCES) attempt_number {resources_requested}
+    # time manager_pid TASK task_id RUNNING worker_id (FIRST_RESOURCES|MAX_RESOURCES) {resources_allocated}
+    # time manager_pid TASK task_id WAITING_RETRIEVAL worker_id
+    # time manager_pid TASK task_id RETRIEVED (SUCCESS|UNKNOWN|INPUT_MISSING|OUTPUT_MISSING|STDOUT_MISSING|SIGNAL|RESOURCE_EXHAUSTION|MAX_RETRIES|MAX_END_TIME|MAX_WALL_TIME|FORSAKEN) {limits_exceeded} {resources_measured}
+    # time manager_pid TASK task_id DONE (SUCCESS|UNKNOWN|INPUT_MISSING|OUTPUT_MISSING|STDOUT_MISSING|SIGNAL|RESOURCE_EXHAUSTION|MAX_RETRIES|MAX_END_TIME|MAX_WALL_TIME|FORSAKEN) exit_code
+    # time manager_pid LIBRARY library_id (WAITING|SENT|STARTED|FAILURE) worker_id
+    # time manager_pid APPLICATION message*
+
     global start_time_us
 
     cursor = conn.cursor()
@@ -1940,9 +1955,9 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
         next_line_num = 1
         bytes_read_before = 0
 
-    # Create transactions table with line numbers
+    # Create transactions table per event type, and state with line numbers
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
+        CREATE TABLE IF NOT EXISTS txns_manager (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             line_number INTEGER,
             time_us INTEGER,
@@ -1950,54 +1965,79 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
             manager_pid INTEGER,
             event_type TEXT,
             event_data TEXT,
-            task_id INTEGER,
-            worker_id TEXT,
-            category TEXT,
             raw_line TEXT
         )
     """)
-    # Resources table: one row per limits_exceeded or resources_measured with at least one value (no all-NULL rows).
-    # retrieved.limits -> limits_exceeded (set only on RESOURCE_EXHAUSTION); retrieved.resources -> resources_measured.
-    resource_cols = ", ".join(f"{n} REAL" for n in _RESOURCE_NAMES)
-
-    # Migrate if old schema: retrieved had limits_first/resources_first, or junction tables / catalog resources existed.
-    retrieved_cols = set()
-    resources_cols = set()
-    try:
-        cursor.execute("PRAGMA table_info(retrieved)")
-        retrieved_cols = {row[1] for row in cursor.fetchall()}
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("PRAGMA table_info(resources)")
-        resources_cols = {row[1] for row in cursor.fetchall()}
-    except sqlite3.OperationalError:
-        pass
-    if (
-        "limits_first" in retrieved_cols
-        or "resources_first" in retrieved_cols
-        or "name" in resources_cols
-    ):
-        cursor.execute("DROP TABLE IF EXISTS retrieved_limits")
-        cursor.execute("DROP TABLE IF EXISTS retrieved_resources")
-        cursor.execute("DROP TABLE IF EXISTS retrieved")
-        cursor.execute("DROP TABLE IF EXISTS resources")
-
-    cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS resources (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            {resource_cols}
-        )
-    """)
-    # Table for parsed RETRIEVED lines; limits and resources are FKs to resources(id).
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS retrieved (
+        CREATE TABLE IF NOT EXISTS txns_worker (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             line_number INTEGER,
             time_us INTEGER,
             time_relative TEXT,
             manager_pid INTEGER,
+            event_type TEXT,
+            event_data TEXT,
+            raw_line TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS txns_category (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_number INTEGER,
+            time_us INTEGER,
+            time_relative TEXT,
+            name TEXT,
+            event_type TEXT,
+            resources INTEGER REFERENCES resources(id),
+            raw_line TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS txns_waiting (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_number INTEGER,
+            time_us INTEGER,
+            time_relative TEXT,
             task_id INTEGER,
+            attempt_number INTEGER,
+            category TEXT,
+            resources INTEGER REFERENCES resources(id),
+            raw_line TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS txns_running (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_number INTEGER,
+            time_us INTEGER,
+            time_relative TEXT,
+            task_id INTEGER,
+            attempt_number INTEGER,
+            worker_id TEXT,
+            resources INTEGER REFERENCES resources(id),
+            raw_line TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS txns_waiting_retrieval (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_number INTEGER,
+            time_us INTEGER,
+            time_relative TEXT,
+            task_id INTEGER,
+            attempt_number INTEGER,
+            raw_line TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS txns_retrieved (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_number INTEGER,
+            time_us INTEGER,
+            time_relative TEXT,
+            task_id INTEGER,
+            attempt_number INTEGER,
             result TEXT,
             exit_code INTEGER,
             limits INTEGER REFERENCES resources(id),
@@ -2005,38 +2045,81 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
             raw_line TEXT
         )
     """)
-    if not resume:
-        cursor.execute("DELETE FROM retrieved")
-        cursor.execute("DELETE FROM resources")
 
-    RESOURCES_INSERT_SQL = """
-        INSERT INTO resources ({cols}) VALUES ({placeholders})
-    """.format(
-        cols=", ".join(_RESOURCE_NAMES),
-        placeholders=", ".join("?" * len(_RESOURCE_NAMES)),
-    )
-    TXN_INSERT_SQL = """
-        INSERT INTO transactions
-        (line_number, time_us, time_relative, manager_pid, event_type, event_data,
-         task_id, worker_id, category, raw_line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    RETRIEVED_INSERT_SQL = """
-        INSERT INTO retrieved
-        (line_number, time_us, time_relative, manager_pid, task_id, result, exit_code, limits, resources, raw_line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
+    # View unifies all transaction tables for queries; task_id is NULL for non-task events.
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS txns AS
+            SELECT line_number, time_us, time_relative, raw_line, NULL AS task_id FROM txns_manager
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, NULL AS task_id FROM txns_worker
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, NULL AS task_id FROM txns_category
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, task_id FROM txns_waiting
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, task_id FROM txns_running
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, task_id FROM txns_waiting_retrieval
+            UNION ALL
+            SELECT line_number, time_us, time_relative, raw_line, task_id FROM txns_retrieved
+            ORDER BY line_number
+    """)
+
+    # Resources table: one row per limits_exceeded or resources_measured with at least one value (no all-NULL rows).
+    resource_cols = ", ".join(f"{n} REAL" for n in _RESOURCE_NAMES)
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS resources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            {resource_cols}
+        )
+    """)
+
+    # INSERT statements for each transaction table (for executemany).
+    _INSERT_MANAGER = """INSERT INTO txns_manager (line_number, time_us, time_relative, manager_pid, event_type, event_data, raw_line) VALUES (?,?,?,?,?,?,?)"""
+    _INSERT_WORKER = """INSERT INTO txns_worker (line_number, time_us, time_relative, manager_pid, event_type, event_data, raw_line) VALUES (?,?,?,?,?,?,?)"""
+    _INSERT_CATEGORY = """INSERT INTO txns_category (line_number, time_us, time_relative, name, event_type, resources, raw_line) VALUES (?,?,?,?,?,?,?)"""
+    _INSERT_TASK_WAITING = """INSERT INTO txns_waiting (line_number, time_us, time_relative, task_id, category, attempt_number, resources, raw_line) VALUES (?,?,?,?,?,?,?,?)"""
+    _INSERT_TASK_RUNNING = """INSERT INTO txns_running (line_number, time_us, time_relative, task_id, attempt_number, worker_id, resources, raw_line) VALUES (?,?,?,?,?,?,?,?)"""
+    _INSERT_TASK_WAITING_RETRIEVAL = """INSERT INTO txns_waiting_retrieval (line_number, time_us, time_relative, task_id, attempt_number, raw_line) VALUES (?,?,?,?,?,?)"""
+    _INSERT_TASK_RETRIEVED = """INSERT INTO txns_retrieved (line_number, time_us, time_relative, task_id, attempt_number, result, exit_code, limits, resources, raw_line) VALUES (?,?,?,?,?,?,?,?,?,?)"""
+
+    _TXN_INSERT_SQL = {
+        "txns_manager": _INSERT_MANAGER,
+        "txns_worker": _INSERT_WORKER,
+        "txns_category": _INSERT_CATEGORY,
+        "txns_waiting": _INSERT_TASK_WAITING,
+        "txns_running": _INSERT_TASK_RUNNING,
+        "txns_waiting_retrieval": _INSERT_TASK_WAITING_RETRIEVAL,
+        "txns_retrieved": _INSERT_TASK_RETRIEVED,
+    }
+
+    def flush_batch(table_name):
+        b = batches[table_name]
+        if b:
+            cursor.executemany(_TXN_INSERT_SQL[table_name], b)
+            batches[table_name] = []
+
     BATCH_SIZE = 5000
-    retrieved_count = 0
-
     total_bytes = max(1, log_file.stat().st_size)
     start_time = time.time()
     last_pct = None
     label = f"Parsing {log_file.name}" if not resume else f"Refreshing {log_file.name}"
-    batch = []
+    batches = {
+        "txns_manager": [],
+        "txns_worker": [],
+        "txns_category": [],
+        "txns_waiting": [],
+        "txns_running": [],
+        "txns_waiting_retrieval": [],
+        "txns_retrieved": [],
+    }
+    current_attempts = {}
+
     count = 0
+    retrieved_count = 0
     last_line_num = start_line_num if resume else 0
     bytes_read_this_run = 0
+
     with open(log_file, "r") as f:
         if resume:
             f.seek(start_byte)
@@ -2050,158 +2133,98 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
                 last_pct = print_parse_progress(
                     last_bytes_read, total_bytes, line_num, start_time, label, last_pct
                 )
-            line = line.strip()
-            if not line or line.startswith("#"):
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith("#"):
                 continue
 
-            parts = line.split(None, 2)
+            parts = line_stripped.split(None, 2)
             if len(parts) < 3:
                 continue
 
-            timestamp_str = parts[0]
-            manager_pid_str = parts[1]
-            event_data = parts[2]
-
+            timestamp_str, manager_pid_str, event_data = parts[0], parts[1], parts[2]
             timestamp_us = parse_timestamp_us(timestamp_str)
             if timestamp_us is None:
                 continue
-
             manager_pid = int(manager_pid_str) if manager_pid_str.isdigit() else None
-
-            event_type = None
-            task_id = None
-            worker_id = None
-            category = None
-
-            if event_data.startswith("MANAGER"):
-                event_type = "MANAGER"
-            elif event_data.startswith("WORKER"):
-                event_type = "WORKER"
-                worker_match = re.match(r"WORKER\s+(\S+)", event_data)
-                if worker_match:
-                    worker_id = worker_match.group(1)
-            elif event_data.startswith("CATEGORY"):
-                event_type = "CATEGORY"
-                cat_match = re.match(r"CATEGORY\s+(\S+)", event_data)
-                if cat_match:
-                    category = cat_match.group(1)
-            elif event_data.startswith("TASK"):
-                event_type = "TASK"
-                task_match = re.match(r"TASK\s+(\d+)", event_data)
-                if task_match:
-                    task_id = int(task_match.group(1))
-                worker_match = re.search(
-                    r"\s+(\S+)\s+(?:RUNNING|WAITING_RETRIEVAL)", event_data
-                )
-                if worker_match:
-                    worker_id = worker_match.group(1)
-                cat_match = re.search(r"WAITING\s+(\S+)", event_data)
-                if cat_match:
-                    category = cat_match.group(1)
-            elif event_data.startswith("LIBRARY"):
-                event_type = "LIBRARY"
-            elif event_data.startswith("APPLICATION"):
-                event_type = "APPLICATION"
-
             time_relative = format_relative_time(timestamp_us)
-            row = (
-                line_num,
-                timestamp_us,
-                time_relative,
-                manager_pid,
-                event_type,
-                event_data,
-                task_id,
-                worker_id,
-                category,
-                line,
-            )
-            batch.append(row)
-            count += 1
 
-            # Parse RETRIEVED lines: one resources row per limits set, one per resources set; retrieved has limits/resources FKs.
+            # RETRIEVED: insert resources for limits/resources, then one row into txns_retrieved.
             retrieved_match = _RETRIEVED_RE.match(event_data)
             if retrieved_match:
                 t_id = int(retrieved_match.group(1))
                 result_str = retrieved_match.group(2)
                 exit_code_val = int(retrieved_match.group(3))
                 rest = retrieved_match.group(4)
-                # First JSON is limits_exceeded (often {}); second is resources_measured. Only insert rows that have at least one value to avoid all-NULL rows.
                 limits_str, resources_str = _parse_two_json_objects(rest)
-                limits_id = None
-                resources_id = None
-                if limits_str:
-                    try:
-                        limits_obj = json.loads(limits_str)
-                        limits_row = _resource_row_from_parsed(
-                            _parse_resource_values(limits_obj)
-                        )
-                        if _resource_row_has_any_value(limits_row):
-                            cursor.execute(RESOURCES_INSERT_SQL, limits_row)
-                            limits_id = cursor.lastrowid
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                if resources_str:
-                    try:
-                        resources_obj = json.loads(resources_str)
-                        resources_row = _resource_row_from_parsed(
-                            _parse_resource_values(resources_obj)
-                        )
-                        if _resource_row_has_any_value(resources_row):
-                            cursor.execute(RESOURCES_INSERT_SQL, resources_row)
-                            resources_id = cursor.lastrowid
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                cursor.execute(
-                    RETRIEVED_INSERT_SQL,
-                    (
-                        line_num,
-                        timestamp_us,
-                        time_relative,
-                        manager_pid,
-                        t_id,
-                        result_str,
-                        exit_code_val,
-                        limits_id,
-                        resources_id,
-                        line,
-                    ),
+                limits_id = _insert_resource_row(cursor, limits_str) if limits_str else None
+                resources_id = _insert_resource_row(cursor, resources_str) if resources_str else None
+                row = (
+                    line_num,
+                    timestamp_us,
+                    time_relative,
+                    t_id,
+                    current_attempts.get(t_id, 0),
+                    result_str,
+                    exit_code_val,
+                    limits_id,
+                    resources_id,
+                    line_stripped,
                 )
+                batches["txns_retrieved"].append(row)
+                if len(batches["txns_retrieved"]) >= BATCH_SIZE:
+                    flush_batch("txns_retrieved")
                 retrieved_count += 1
+                count += 1
+                continue
 
-            if len(batch) >= BATCH_SIZE:
-                cursor.executemany(TXN_INSERT_SQL, batch)
-                batch = []
+            # Dispatch to per-event parsers; each returns (table_name, row_list, resource_json) or None.
+            parsed = None
+            if event_data.startswith("MANAGER") or event_data.startswith("LIBRARY") or event_data.startswith("APPLICATION"):
+                parsed = _parse_txn_manager_row(line_num, timestamp_us, time_relative, manager_pid, event_data, line_stripped)
+            elif event_data.startswith("WORKER"):
+                parsed = _parse_txn_worker_row(line_num, timestamp_us, time_relative, manager_pid, event_data, line_stripped)
+            elif event_data.startswith("CATEGORY"):
+                parsed = _parse_txn_category_row(line_num, timestamp_us, time_relative, event_data, line_stripped)
+            elif event_data.startswith("TASK"):
+                parsed = _parse_txn_task_row(line_num, timestamp_us, time_relative, event_data, line_stripped, current_attempts)
 
-    if batch:
-        cursor.executemany(TXN_INSERT_SQL, batch)
+            if parsed is None:
+                continue
+            table_name, row_list, resource_json = parsed
+            if resource_json:
+                rid = _insert_resource_row(cursor, resource_json)
+                if table_name == "txns_category":
+                    row_list[5] = rid
+                elif table_name in ("txns_waiting", "txns_running"):
+                    row_list[6] = rid
+            row = tuple(row_list)
+            batches[table_name].append(row)
+            if len(batches[table_name]) >= BATCH_SIZE:
+                flush_batch(table_name)
+            count += 1
 
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_time ON transactions(time_us)")
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_txn_line ON transactions(line_number)"
-    )
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task ON transactions(task_id)")
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_txn_worker ON transactions(worker_id)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_txn_event ON transactions(event_type)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_retrieved_time ON retrieved(time_us)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_retrieved_task ON retrieved(task_id)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_retrieved_result ON retrieved(result)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_retrieved_limits_fk ON retrieved(limits)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_retrieved_resources_fk ON retrieved(resources)"
-    )
+    for table_name in batches:
+        flush_batch(table_name)
+
+    # Indexes on base tables (txns is a view and cannot be indexed).
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_manager_time ON txns_manager(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_manager_line ON txns_manager(line_number)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_worker_time ON txns_worker(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_worker_line ON txns_worker(line_number)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_category_time ON txns_category(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_category_line ON txns_category(line_number)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_waiting_time ON txns_waiting(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_waiting_task ON txns_waiting(task_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_running_time ON txns_running(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_running_task ON txns_running(task_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_running_worker ON txns_running(worker_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_waiting_retrieval_time ON txns_waiting_retrieval(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_waiting_retrieval_task ON txns_waiting_retrieval(task_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_retrieved_time ON txns_retrieved(time_us)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_retrieved_task ON txns_retrieved(task_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_retrieved_result ON txns_retrieved(result)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_retrieved_limits ON txns_retrieved(limits)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_txn_task_retrieved_resources ON txns_retrieved(resources)")
 
     print_parse_progress(
         bytes_read_before + bytes_read_this_run,
@@ -2215,7 +2238,7 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
     conn.commit()
     print(f"Parsed {count} transaction log entries")
     if retrieved_count:
-        print(f"Parsed {retrieved_count} RETRIEVED entries into retrieved table")
+        print(f"Parsed {retrieved_count} RETRIEVED entries into txns_retrieved")
     return (bytes_read_before + bytes_read_this_run, last_line_num)
 
 
