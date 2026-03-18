@@ -326,6 +326,11 @@ def _resource_row_from_parsed(parsed):
     return tuple(parsed.get(n) for n in _RESOURCE_NAMES)
 
 
+def _resource_row_has_any_value(row):
+    """Return True if row (tuple from _resource_row_from_parsed) has at least one non-None value."""
+    return row is not None and any(v is not None for v in row)
+
+
 def _parse_two_json_objects(s):
     """Parse two JSON objects from string s (limits then resources). Returns (limits_str, resources_str) or (None, None)."""
     s = s.strip()
@@ -359,7 +364,7 @@ def _parse_two_json_objects(s):
     return None, None
 
 
-# RETRIEVED line: TASK task_id RETRIEVED result exit_code {limits} {resources}
+# RETRIEVED line: TASK task_id RETRIEVED result exit_code {limits_exceeded} {resources_measured}
 _RETRIEVED_RE = re.compile(
     r"TASK\s+(\d+)\s+RETRIEVED\s+"
     r"(SUCCESS|UNKNOWN|INPUT_MISSING|OUTPUT_MISSING|STDOUT_MISSING|SIGNAL|"
@@ -1951,8 +1956,8 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
             raw_line TEXT
         )
     """)
-    # Resources table: one row per limits or resources set; all possible resources as columns (value only, no units).
-    # retrieved.limits and retrieved.resources are foreign keys to this table.
+    # Resources table: one row per limits_exceeded or resources_measured with at least one value (no all-NULL rows).
+    # retrieved.limits -> limits_exceeded (set only on RESOURCE_EXHAUSTION); retrieved.resources -> resources_measured.
     resource_cols = ", ".join(f"{n} REAL" for n in _RESOURCE_NAMES)
 
     # Migrate if old schema: retrieved had limits_first/resources_first, or junction tables / catalog resources existed.
@@ -2121,6 +2126,7 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
                 result_str = retrieved_match.group(2)
                 exit_code_val = int(retrieved_match.group(3))
                 rest = retrieved_match.group(4)
+                # First JSON is limits_exceeded (often {}); second is resources_measured. Only insert rows that have at least one value to avoid all-NULL rows.
                 limits_str, resources_str = _parse_two_json_objects(rest)
                 limits_id = None
                 resources_id = None
@@ -2130,8 +2136,9 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
                         limits_row = _resource_row_from_parsed(
                             _parse_resource_values(limits_obj)
                         )
-                        cursor.execute(RESOURCES_INSERT_SQL, limits_row)
-                        limits_id = cursor.lastrowid
+                        if _resource_row_has_any_value(limits_row):
+                            cursor.execute(RESOURCES_INSERT_SQL, limits_row)
+                            limits_id = cursor.lastrowid
                     except (json.JSONDecodeError, TypeError):
                         pass
                 if resources_str:
@@ -2140,8 +2147,9 @@ def parse_transaction_log(conn, log_file, start_byte=None, start_line_num=None):
                         resources_row = _resource_row_from_parsed(
                             _parse_resource_values(resources_obj)
                         )
-                        cursor.execute(RESOURCES_INSERT_SQL, resources_row)
-                        resources_id = cursor.lastrowid
+                        if _resource_row_has_any_value(resources_row):
+                            cursor.execute(RESOURCES_INSERT_SQL, resources_row)
+                            resources_id = cursor.lastrowid
                     except (json.JSONDecodeError, TypeError):
                         pass
                 cursor.execute(
