@@ -140,7 +140,12 @@ char *batch_file_generate_id_dir(char *file_name)
 	}
 	char *check_sum_value = hash_table_lookup(check_sums, file_name);
 	if (check_sum_value == NULL) {
-		char *hash_sum = "";
+		/* Must be heap-allocated, not a string literal: if file_name is an
+		empty directory (only "." and ".." entries), the loop below never
+		reassigns hash_sum, and it would otherwise reach free(hash_sum) at
+		the end of this block still pointing at a string literal --
+		undefined behavior (glibc aborts on it). */
+		char *hash_sum = xxstrdup("");
 		struct dirent **dp;
 		int num;
 		// Scans directory and sorts in reverse order
