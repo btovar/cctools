@@ -225,7 +225,12 @@ int rmonitor_helper_init(char *lib_default_path, int *fd, int stop_short_running
 
 	if (access(helper_absolute, R_OK | X_OK) == 0) {
 		debug(D_RMON, "found helper in %s\n", helper_absolute);
-		rmonitor_server_open_socket(fd, &port);
+		/* rmonitor_server_open_socket() only writes *port on success; on
+		failure (bad port range, or socket() itself failing) it returns 0
+		without touching *port, which previously left this port variable
+		uninitialized. Its return value mirrors *port on success and is 0
+		on failure either way, so assign from the return value instead. */
+		port = rmonitor_server_open_socket(fd, &port);
 	} else {
 		debug(D_RMON, "couldn't find helper library %s but continuing anyway.", helper_path);
 		port = -1;
