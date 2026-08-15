@@ -166,10 +166,21 @@ void warn(int64_t flags, const char *fmt, ...);
 
 /** Emit a fatal debugging message and terminate with SIGTERM.
 Displays a printf-style message, and then forcibly exits the program.
+fatal() never returns (see debug.c: it loops raising SIGTERM then SIGKILL
+until the process dies), but was missing the noreturn attribute that says
+so. Without it, every "if (x == NULL) fatal(...);" guard throughout the
+codebase looked to static analyzers like x could still be NULL afterward --
+this was confirmed to be the single largest source of clang scan-build
+false positives when the CI static-analysis job was introduced (see the
+taskvine tech-debt audit's "static analysis" item).
 @param fmt A printf-style formatting string, followed by the necessary arguments.
 */
 
-void fatal(const char *fmt, ...);
+void fatal(const char *fmt, ...)
+#ifndef SWIG
+__attribute__ ((noreturn))
+#endif
+;
 
 
 /** Emit a notice message.
