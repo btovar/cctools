@@ -6197,6 +6197,17 @@ void work_queue_delete(struct work_queue *q)
 			remove_factory_info(q, key);
 		}
 
+		{
+			/* any hosts still on the blocklist at shutdown were never
+			freed by work_queue_unblock_host(); drain them here,
+			mirroring the factory_table cleanup just above. */
+			char *blocked_hostname;
+			struct blocklist_host_info *binfo;
+			HASH_TABLE_ITERATE(q->worker_blocklist, iteration, blocked_hostname, binfo) {
+				free(binfo);
+			}
+		}
+
 		log_queue_stats(q, 1);
 
 		if(q->name) {
@@ -6751,8 +6762,11 @@ void work_queue_unblock_host(struct work_queue *q, const char *hostname)
 {
 	struct blocklist_host_info *info = hash_table_remove(q->worker_blocklist, hostname);
 	if(info) {
-		info->blocked = 0;
-		info->release_at  = 0;
+		/* info is now detached from worker_blocklist -- mutating it and
+		dropping it here leaked one struct per unblock. This runs every
+		wait cycle via work_queue_unblock_all_by_time(), so it leaked
+		repeatedly for the life of a long-running manager. */
+		free(info);
 	}
 }
 
