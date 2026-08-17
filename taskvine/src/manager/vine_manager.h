@@ -285,6 +285,11 @@ struct rmsummary *vine_manager_choose_resources_for_task( struct vine_manager *q
 
 int64_t overcommitted_resource_total(struct vine_manager *q, int64_t total);
 
+/* Return true (the worker's total worker-slot count) if this worker's total resources
+ * can satisfy the given resource request, or false (0) otherwise. If s is NULL, only
+ * the worker's total worker-slot count is checked/returned. */
+int check_worker_fit(struct vine_worker_info *w, const struct rmsummary *s);
+
 /* Internal: Shut down a specific worker. */
 int vine_manager_shut_down_worker(struct vine_manager *q, struct vine_worker_info *w);
 

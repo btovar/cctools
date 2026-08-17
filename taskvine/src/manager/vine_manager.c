@@ -1966,9 +1966,10 @@ static const struct rmsummary *largest_seen_resources(struct vine_manager *q, co
 	}
 }
 
-/* Return true if this worker can satisfy the given resource request. */
+/* Return true if this worker can satisfy the given resource request.
+ * Not static: exercised directly by vine_manager_test.c. */
 
-static int check_worker_fit(struct vine_worker_info *w, const struct rmsummary *s)
+int check_worker_fit(struct vine_worker_info *w, const struct rmsummary *s)
 {
 
 	if (w->resources->workers.total < 1)
