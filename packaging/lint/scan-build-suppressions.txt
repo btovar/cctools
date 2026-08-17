@@ -8,8 +8,9 @@
 # build.
 
 # All entries below were triaged individually (source read against the
-# analyzer's own path trace, not just the finding text) across two rounds,
-# after the job was first introduced with a larger, unreviewed baseline.
+# analyzer's own path trace, not just the finding text) across three
+# rounds, after the job was first introduced with a larger, unreviewed
+# baseline.
 
 # Round 1 (null-pointer / uninitialized-value checkers):
 #   - Fixed 6 real bugs: closedir(NULL) in taskvine/src/worker/vine_cache.c,
@@ -65,8 +66,82 @@
 #     resource_monitor/src/rminimonitor_helper.c (clang doesn't know
 #     syscall(SYS_exit,...) never returns), dttools/src/skip_list.c (clang
 #     can't see that sl->level is invariantly non-negative), and a second
-#     division-by-zero in makeflow/src/dag_visitors.c:1069 (mathematically
+#     division-by-zero in makeflow/src/dag_visitors.c (mathematically
 #     unreachable given the code's own clamping logic).
+
+# Round 3 (memory-leak and dead-code checkers -- lower bug density per
+# finding, so not swept in the first two rounds; triaged via parallel
+# subagents each reading the flagged function in full against the
+# analyzer's path trace, one round for the 57 memory-leak findings, one
+# for the 27 dead-code findings):
+#   - Fixed 8 real memory leaks: the final logical-file chunk built by
+#     dttools/src/chunk.c's chunk_parse_file() was never linked into the
+#     returned chunk_set (a correctness bug, not just a leak -- silently
+#     dropped the last file's data on every parse), plus a leak on that
+#     function's fopen()-failure path; an EC2 instance-id string leaked
+#     once per instance in batch_job/src/batch_queue_amazon.c; per-task
+#     side-table structs were never freed in
+#     batch_job/src/batch_queue_flux.c and batch_job/src/batch_queue_k8s.c
+#     (both accumulate for the life of a long-running manager -- the k8s
+#     fix also required zeroing a previously-malloc'd struct field so the
+#     new free() path wouldn't free garbage, and capturing a job id by
+#     value before freeing the struct it came from, in a caller that
+#     otherwise would have read it after the free); dttools/src/rmonitor_poll.c
+#     leaked its result struct on a start-time-read failure inside a loop
+#     polled every few seconds by taskvine/work_queue's resource
+#     reporting; makeflow/src/makeflow_alloc.c's makeflow_alloc_commit_space()
+#     leaked an allocation on a grow-failure path that its sibling
+#     function (makeflow_alloc_check_space()) already handled correctly;
+#     work_queue/src/work_queue.c's work_queue_unblock_host() detached a
+#     struct from the blocklist hash table and then just dropped it
+#     instead of freeing it, on every unblock for the life of the manager
+#     (also drained any hosts still blocked at shutdown, which had the
+#     same problem).
+#   - Fixed 3 real dead-code/logic bugs found while triaging the
+#     "unused code" checkers: chirp/src/chirp_matrix.c discarded the
+#     result of three mkdir() calls building a data host's directory
+#     structure, silently ignoring remote mkdir failures;
+#     deltadb/src/deltadb_stream.c had a stray `continue` in the 'U'
+#     (update) record handler that caused every update event whose value
+#     failed jx_parse_string() to be silently dropped instead of
+#     delivered (copy-paste asymmetry vs. the working 'C' handler just
+#     above); makeflow/src/dag_visitors.c computed a file node's
+#     size-proportional width for the --change-size XGMML/Cytoscape
+#     output but wrote the node before computing it, so the option was
+#     silently a no-op for that output format.
+#   - Fixed 1 real regression while triaging "dead increment":
+#     taskvine/src/manager/vine_manager.c's main wait loop stopped
+#     tracking worker disconnects/shutdowns as "events" after a refactor
+#     (git blame confirms this check used to exist and was accidentally
+#     dropped), which could cause the manager's polling loop to sleep
+#     right after actually doing work.
+#   - Confirmed real, but low-impact (left as-is, not fixed) --
+#     chirp/src/chirp_distribute.c:436,490,648,827 (bandwidth-file/cluster
+#     parsing arrays never freed, but chirp_distribute is a one-shot CLI
+#     tool); chirp/src/chirp_stream_files.c:149,209,
+#     chirp/src/chirp_tool.c, deltadb/src/catalog_server.c,
+#     dttools/src/jx2json.c, dttools/src/copy_tree.c (bounded, one-shot,
+#     or startup-only leaks); makeflow/src/dag_visitors.c:404 and
+#     makeflow/src/makeflow_linker.c (one-shot makeflow_linker/viz CLI
+#     tools); taskvine/src/manager/vine_manager.c:4099 (manager
+#     construction failure -- caller aborts right after anyway);
+#     work_queue/src/work_queue.c:5601 (a malloc() failure branch,
+#     essentially unreachable).
+#   - The remaining ~90 memory-leak/dead-code findings (and the ones newly
+#     surfaced or shifted by the round-3 fixes above) were confirmed
+#     false positives or genuinely cosmetic: the dominant pattern by far
+#     is clang's leak checker not modeling hash_table_insert()/
+#     itable_insert() as an ownership transfer (both take a `const void *`
+#     value parameter, which defeats the analyzer's escape analysis) --
+#     every one of these tables' entries is in fact freed later, either
+#     individually on removal or in bulk at teardown. This same blind spot
+#     re-flags a few of the round-3 fixes above at their allocation/insert
+#     site even though the leak is now genuinely closed (confirmed by
+#     both a source read and a clean valgrind run) -- clang just can't
+#     trace the free across into the separate function that now performs
+#     it. The dead-code findings are almost all the standard
+#     `if ((x = call()) COMPARISON)` get-and-check idiom, where the
+#     "unused" value was in fact read in the condition itself.
 
 # Confirmed real, but low-impact (left as-is, not fixed):
 #   - taskvine/src/manager/vine_manager_get.c:68 -- reads an uninitialized
@@ -94,17 +169,6 @@
 #     omitted from the break-point list) without tracing the full
 #     recursive splitting logic.
 
-# Not yet triaged (memory-leak and dead-code checkers -- lower bug density
-# per finding, so not swept in the two rounds above):
-#   - The 57 bt_memory_error_memory_leak findings are almost all in
-#     one-shot CLI tools and error/exit paths (leaked memory reclaimed by
-#     process exit), not long-running manager/worker loops, based on a
-#     spot check -- lower urgency, but not individually triaged.
-#   - The 16 bt_unused_code_dead_assignment, 7
-#     bt_unused_code_dead_nested_assignment, 2
-#     bt_unused_code_dead_initialization, and 2 bt_unused_code_dead_increment
-#     findings are code-cleanliness, not correctness bugs -- not triaged.
-
 # Regenerate after a source change that shifts these locations by
 # re-running packaging/lint/scan-build.sh locally and diffing its output
 # (via packaging/lint/scan-build-parse.py) against this file, rather than
@@ -112,7 +176,7 @@
 
 bt_api_argument_with_nonnull_attribute_passed_null:batch_job/src/work_queue_factory.c:1709
 bt_api_argument_with_nonnull_attribute_passed_null:dttools/src/catalog_query.c:60
-bt_api_argument_with_nonnull_attribute_passed_null:dttools/src/chunk.c:95
+bt_api_argument_with_nonnull_attribute_passed_null:dttools/src/chunk.c:99
 bt_api_argument_with_nonnull_attribute_passed_null:dttools/src/http_query.c:73
 bt_api_argument_with_nonnull_attribute_passed_null:dttools/src/pattern.c:60
 bt_api_argument_with_nonnull_attribute_passed_null:makeflow/src/makeflow_hook.c:97
@@ -125,7 +189,7 @@ bt_api_argument_with_nonnull_attribute_passed_null:work_queue/src/work_queue.c:5
 bt_api_argument_with_nonnull_attribute_passed_null:work_queue/src/work_queue_status.c:313
 bt_api_argument_with_nonnull_attribute_passed_null:work_queue/src/work_queue_worker.c:2378
 bt_logic_error_assigned_value_is_garbage_or_undefined:chirp/src/chirp_fs_local.c:1013
-bt_logic_error_assigned_value_is_garbage_or_undefined:chirp/src/chirp_matrix.c:140
+bt_logic_error_assigned_value_is_garbage_or_undefined:chirp/src/chirp_matrix.c:145
 bt_logic_error_assigned_value_is_garbage_or_undefined:dttools/src/bitmap.c:615
 bt_logic_error_assigned_value_is_garbage_or_undefined:dttools/src/bucketing_det_greedy.c:355
 bt_logic_error_assigned_value_is_garbage_or_undefined:dttools/src/bucketing_greedy.c:348
@@ -148,7 +212,7 @@ bt_logic_error_dereference_of_null_pointer:taskvine/src/worker/vine_worker.c:230
 bt_logic_error_dereference_of_null_pointer:work_queue/src/work_queue_worker.c:2924
 bt_logic_error_dereference_of_null_pointer:work_queue/src/work_queue_worker.c:357
 bt_logic_error_dereference_of_undefined_pointer_value:dttools/src/skip_list.c:711
-bt_logic_error_division_by_zero:makeflow/src/dag_visitors.c:1072
+bt_logic_error_division_by_zero:makeflow/src/dag_visitors.c:1086
 bt_logic_error_result_of_operation_is_garbage_or_undefined:chirp/src/chirp_distribute.c:798
 bt_logic_error_result_of_operation_is_garbage_or_undefined:dttools/src/bitmap.c:615
 bt_logic_error_result_of_operation_is_garbage_or_undefined:dttools/src/category.c:337
@@ -173,15 +237,14 @@ bt_logic_error_uninitialized_argument_value:dttools/src/luapatt.c:72
 bt_logic_error_uninitialized_argument_value:dttools/src/set.c:569
 bt_logic_error_uninitialized_argument_value:ftp_lite/src/network.c:309
 bt_logic_error_uninitialized_argument_value:makeflow/src/makeflow_mounts.c:297
-bt_memory_error_memory_leak:batch_job/src/batch_queue_amazon.c:710
-bt_memory_error_memory_leak:batch_job/src/batch_queue_amazon.c:712
+bt_memory_error_memory_leak:batch_job/src/batch_queue_amazon.c:719
 bt_memory_error_memory_leak:batch_job/src/batch_queue_cluster.c:309
 bt_memory_error_memory_leak:batch_job/src/batch_queue_condor.c:224
 bt_memory_error_memory_leak:batch_job/src/batch_queue_condor.c:318
 bt_memory_error_memory_leak:batch_job/src/batch_queue_dryrun.c:58
 bt_memory_error_memory_leak:batch_job/src/batch_queue_flux.c:140
-bt_memory_error_memory_leak:batch_job/src/batch_queue_k8s.c:246
-bt_memory_error_memory_leak:batch_job/src/batch_queue_k8s.c:249
+bt_memory_error_memory_leak:batch_job/src/batch_queue_k8s.c:262
+bt_memory_error_memory_leak:batch_job/src/batch_queue_k8s.c:265
 bt_memory_error_memory_leak:batch_job/src/batch_queue_local.c:41
 bt_memory_error_memory_leak:chirp/src/chirp_audit.c:76
 bt_memory_error_memory_leak:chirp/src/chirp_distribute.c:436
@@ -196,24 +259,20 @@ bt_memory_error_memory_leak:deltadb/src/catalog_server.c:868
 bt_memory_error_memory_leak:deltadb/src/deltadb_reduction.c:110
 bt_memory_error_memory_leak:dttools/src/bucketing_manager.c:221
 bt_memory_error_memory_leak:dttools/src/bucketing_manager.c:339
-bt_memory_error_memory_leak:dttools/src/chunk.c:132
-bt_memory_error_memory_leak:dttools/src/chunk.c:89
 bt_memory_error_memory_leak:dttools/src/copy_tree.c:261
 bt_memory_error_memory_leak:dttools/src/hash_cache.c:71
 bt_memory_error_memory_leak:dttools/src/histogram.c:162
 bt_memory_error_memory_leak:dttools/src/histogram.c:230
 bt_memory_error_memory_leak:dttools/src/histogram.c:243
 bt_memory_error_memory_leak:dttools/src/jx2json.c:154
-bt_memory_error_memory_leak:dttools/src/rmonitor_poll.c:1064
-bt_memory_error_memory_leak:dttools/src/rmonitor_poll.c:914
+bt_memory_error_memory_leak:dttools/src/rmonitor_poll.c:1076
 bt_memory_error_memory_leak:makeflow/src/dag_variable.c:117
 bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:404
-bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:567
-bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:593
-bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:743
+bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:574
+bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:600
 bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:757
+bt_memory_error_memory_leak:makeflow/src/dag_visitors.c:771
 bt_memory_error_memory_leak:makeflow/src/lexer.c:1218
-bt_memory_error_memory_leak:makeflow/src/makeflow_alloc.c:282
 bt_memory_error_memory_leak:makeflow/src/makeflow_linker.c:122
 bt_memory_error_memory_leak:makeflow/src/makeflow_linker.c:274
 bt_memory_error_memory_leak:makeflow/src/makeflow_linker.c:502
@@ -226,30 +285,24 @@ bt_memory_error_memory_leak:work_queue/src/work_queue.c:1656
 bt_memory_error_memory_leak:work_queue/src/work_queue.c:3496
 bt_memory_error_memory_leak:work_queue/src/work_queue.c:3598
 bt_memory_error_memory_leak:work_queue/src/work_queue.c:5601
-bt_memory_error_memory_leak:work_queue/src/work_queue.c:6743
+bt_memory_error_memory_leak:work_queue/src/work_queue.c:6754
 bt_memory_error_memory_leak:work_queue/src/work_queue.c:734
 bt_memory_error_memory_leak:work_queue/src/work_queue_cache.c:107
 bt_memory_error_memory_leak:work_queue/src/work_queue_cache.c:95
 bt_unused_code_dead_assignment:chirp/src/chirp_distribute.c:490
-bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:141
-bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:142
-bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:143
-bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:469
-bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:470
+bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:493
+bt_unused_code_dead_assignment:chirp/src/chirp_matrix.c:494
 bt_unused_code_dead_assignment:chirp/src/chirp_stream_files.c:200
-bt_unused_code_dead_assignment:deltadb/src/deltadb_stream.c:96
 bt_unused_code_dead_assignment:dttools/src/domain_name_cache.c:72
 bt_unused_code_dead_assignment:dttools/src/domain_name_cache.c:99
 bt_unused_code_dead_assignment:dttools/src/priority_queue_test.c:108
 bt_unused_code_dead_assignment:dttools/src/priority_queue_test.c:96
 bt_unused_code_dead_assignment:dttools/src/shell.c:44
-bt_unused_code_dead_assignment:makeflow/src/dag_visitors.c:630
 bt_unused_code_dead_assignment:resource_monitor/src/resource_monitor.c:2452
 bt_unused_code_dead_assignment:taskvine/src/manager/vine_manager.c:1762
 bt_unused_code_dead_increment:dttools/src/path.c:535
-bt_unused_code_dead_increment:taskvine/src/manager/vine_manager.c:5534
 bt_unused_code_dead_initialization:taskvine/src/manager/vine_txn_log.c:330
-bt_unused_code_dead_initialization:work_queue/src/work_queue.c:7817
+bt_unused_code_dead_initialization:work_queue/src/work_queue.c:7831
 bt_unused_code_dead_nested_assignment:chirp/src/chirp_tool.c:1041
 bt_unused_code_dead_nested_assignment:chirp/src/chirp_tool.c:1060
 bt_unused_code_dead_nested_assignment:chirp/src/chirp_tool.c:1066
